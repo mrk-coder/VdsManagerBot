@@ -1,0 +1,172 @@
+# utils/backup.py
+import os
+import tarfile
+from datetime import datetime
+from config.config import BACKUP_STORAGE_PATH
+import logging
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+from email.mime.text import MIMEText
+import ssl
+import requests
+
+def create_backup():
+    """Создаёт бэкап директории /home/mrk/, исключая папку backup и саму папку backups."""
+    try:
+        # Создаём директорию для бэкапов
+        os.makedirs(BACKUP_STORAGE_PATH, exist_ok=True)
+
+        backup_source = "/home/mrk"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"backup_{timestamp}.tar.gz"
+        backup_path = os.path.join(BACKUP_STORAGE_PATH, backup_filename)
+
+        # Создаём tar.gz архив, исключая папки 'backup' и 'backups'
+        with tarfile.open(backup_path, "w:gz") as tar:
+            for root, dirs, files in os.walk(backup_source):
+                # Исключаем 'backup' и 'backups'
+                dirs[:] = [d for d in dirs if d not in ['backup', 'backups']]
+
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    if os.path.islink(file_path):
+                        continue
+                    try:
+                        arcname = os.path.relpath(file_path, backup_source)
+                        tar.add(file_path, arcname=arcname)
+                    except Exception as e:
+                        logging.warning(f"Ошибка при добавлении файла {file_path}: {e}")
+
+        return backup_path, None
+    except PermissionError as e:
+        return None, f"Нет прав на запись в директорию {BACKUP_STORAGE_PATH}: {e}"
+    except Exception as e:
+        return None, str(e)
+
+def list_backups():
+    """Возвращает список доступных бэкапов"""
+    try:
+        backups = []
+        if os.path.exists(BACKUP_STORAGE_PATH):
+            for file in os.listdir(BACKUP_STORAGE_PATH):
+                if file.endswith('.tar.gz'):
+                    file_path = os.path.join(BACKUP_STORAGE_PATH, file)
+                    try:
+                        stat = os.stat(file_path)
+                        backups.append({
+                            'name': file,
+                            'size': stat.st_size,
+                            'date': datetime.fromtimestamp(stat.st_mtime)
+                        })
+                    except Exception as e:
+                        logging.warning(f"Ошибка при чтении файла {file}: {e}")
+        return backups, None
+    except PermissionError as e:
+        return None, f"Нет прав на чтение директории {BACKUP_STORAGE_PATH}: {e}"
+    except Exception as e:
+        return None, str(e)
+
+def send_backup_via_email(file_path, recipient_email):
+    """Отправляет файл бэкапа по электронной почте через Yandex SMTP."""
+    from config.config import EMAIL_CONFIG # Импортируем настройки почты
+
+    if not EMAIL_CONFIG:
+        return False, "Конфигурация почты не найдена."
+
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_CONFIG['sender_email']
+        msg['To'] = recipient_email
+        msg['Subject'] = f"Бэкап сервера от {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+        body = "Во вложении находится бэкап вашего сервера."
+        msg.attach(MIMEText(body, 'plain'))
+
+        with open(file_path, "rb") as attachment:
+            part = MIMEBase('application', 'octet-stream')
+            part.set_payload(attachment.read())
+
+        encoders.encode_base64(part)
+        part.add_header(
+            'Content-Disposition',
+            f'attachment; filename= {os.path.basename(file_path)}',
+        )
+        msg.attach(part)
+
+        # Создаем безопасное соединение и отправляем
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['port'], context=context) as server:
+            server.login(EMAIL_CONFIG['sender_email'], EMAIL_CONFIG['password'])
+            server.sendmail(EMAIL_CONFIG['sender_email'], recipient_email, msg.as_string())
+
+        return True, "Бэкап успешно отправлен на почту."
+    except Exception as e:
+        logging.error(f"Ошибка отправки почты: {e}")
+        return False, f"Ошибка отправки почты: {e}"
+        
+
+
+def upload_to_yandex_disk(file_path, token):
+    """Загружает файл на Яндекс.Диск и возвращает публичную ссылку."""
+    try:
+        # 1. Получаем URL для загрузки
+        upload_url = "https://cloud-api.yandex.net/v1/disk/resources/upload"
+        headers = {"Authorization": f"OAuth {token}"}
+        params = {"path": f"/backups/{os.path.basename(file_path)}", "overwrite": "true"}
+        
+        response = requests.get(upload_url, headers=headers, params=params)
+        response.raise_for_status()
+        href = response.json()['href']
+        
+        # 2. Загружаем файл
+        with open(file_path, 'rb') as f:
+            upload_response = requests.put(href, files={'file': f})
+            upload_response.raise_for_status()
+        
+        # 3. Делаем файл публичным и получаем ссылку
+        publish_url = "https://cloud-api.yandex.net/v1/disk/resources"
+        publish_params = {"path": f"/backups/{os.path.basename(file_path)}", "publish": "true"}
+        publish_response = requests.put(publish_url, headers=headers, params=publish_params)
+        publish_response.raise_for_status()
+        
+        # 4. Получаем метаинформацию для ссылки
+        meta_url = "https://cloud-api.yandex.net/v1/disk/resources"
+        meta_params = {"path": f"/backups/{os.path.basename(file_path)}", "fields": "public_url"}
+        meta_response = requests.get(meta_url, headers=headers, params=meta_params)
+        meta_response.raise_for_status()
+        
+        public_link = meta_response.json().get('public_url')
+        return True, public_link
+        
+    except Exception as e:
+        logging.error(f"Ошибка загрузки на Яндекс.Диск: {e}")
+        return False, str(e)
+
+# Обновите send_backup_via_email или создайте новую функцию
+def send_backup_link_via_email(file_path, recipient_email, download_link):
+    """Отправляет ссылку на бэкап по электронной почте."""
+    from config.config import EMAIL_CONFIG
+
+    if not EMAIL_CONFIG:
+        return False, "Конфигурация почты не найдена."
+
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_CONFIG['sender_email']
+        msg['To'] = recipient_email
+        msg['Subject'] = f"Ссылка на бэкап сервера от {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+        body = f"Бэкап создан. Скачать его можно по ссылке:\n{download_link}\n\nФайл: {os.path.basename(file_path)}\nРазмер: {round(os.path.getsize(file_path) / (1024*1024), 2)} MB"
+        msg.attach(MIMEText(body, 'plain'))
+
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['port'], context=context) as server:
+            server.login(EMAIL_CONFIG['sender_email'], EMAIL_CONFIG['password'])
+            server.sendmail(EMAIL_CONFIG['sender_email'], recipient_email, msg.as_string())
+
+        return True, "Ссылка на бэкап успешно отправлена на почту."
+    except Exception as e:
+        logging.error(f"Ошибка отправки ссылки на почту: {e}")
+        return False, f"Ошибка отправки ссылки на почту: {e}"

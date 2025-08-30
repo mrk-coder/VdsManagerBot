@@ -1,0 +1,95 @@
+# handlers/backup.py
+from aiogram import Router, types
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from utils.security import is_admin
+from utils.backup import create_backup, list_backups, send_backup_via_email
+import os
+import asyncio
+import logging
+from aiogram.types import BufferedInputFile
+from config.config import EMAIL_CONFIG
+
+router = Router()
+
+@router.message(lambda message: message.text == "/backup")
+async def backup_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Только администратор может создавать бэкапы.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💾 Создать бэкап", callback_data="create_backup")
+    builder.button(text="📋 Список бэкапов", callback_data="list_backups")
+    builder.button(text="⬅️ Назад", callback_data="back_to_main")
+    builder.button(text="❌ Закрыть", callback_data="close_backup")
+    builder.adjust(2)
+
+    await message.answer("🔧 Управление бэкапами:", reply_markup=builder.as_markup())
+
+@router.callback_query(lambda c: c.data == "create_backup")
+async def create_backup_callback(callback: types.CallbackQuery):
+    await callback.answer("⏳ Создаю бэкап...", show_alert=False)
+    
+    async def create_backup_task():
+        try:
+            backup_path, error = create_backup()
+            
+            if error:
+                await callback.message.edit_text(f"❌ Ошибка создания бэкапа: {error}")
+                return
+            
+            if not backup_path or not os.path.exists(backup_path):
+                await callback.message.edit_text("❌ Не удалось создать бэкап.")
+                return
+            
+            filename = os.path.basename(backup_path)
+            size = os.path.getsize(backup_path)
+            size_mb = round(size / (1024 * 1024), 2)
+            response = f"✅ Бэкап создан!\n📁 Файл: `{filename}`\n📊 Размер: {size_mb} MB"
+
+            # Определяем способ доставки
+            if size <= 20 * 1024 * 1024: # 20 MB
+                # Отправляем в Telegram
+                try:
+                    with open(backup_path, 'rb') as file:
+                        input_file = BufferedInputFile(file.read(), filename=filename)
+                        await callback.message.bot.send_document(
+                            chat_id=callback.message.chat.id,
+                            document=input_file,
+                            caption=f"📄 Бэкап создан: `{filename}`\n📦 Размер: {size_mb} MB",
+                            parse_mode="Markdown"
+                        )
+                    response += "\n📤 Отправлен в Telegram."
+                except Exception as e:
+                    logging.error(f"Ошибка отправки файла в Telegram: {e}")
+                    response += f"\n⚠️ Не удалось отправить в Telegram: {e}"
+            else:
+                # Отправляем на почту
+                if EMAIL_CONFIG:
+                    # Здесь можно запросить email у пользователя, но для простоты отправим на sender_email
+                    success, msg = send_backup_via_email(backup_path, EMAIL_CONFIG['sender_email'])
+                    if success:
+                        response += f"\n📤 Отправлен на почту ({EMAIL_CONFIG['sender_email']})."
+                    else:
+                        response += f"\n⚠️ Не удалось отправить на почту: {msg}"
+                else:
+                    response += "\n⚠️ Файл > 20MB, но почта не настроена."
+
+            builder = InlineKeyboardBuilder()
+            builder.button(text="⬅️ Назад", callback_data="admin_panel")
+            builder.button(text="❌ Закрыть", callback_data="close_backup")
+            builder.adjust(1)
+            
+            await callback.message.edit_text(response, parse_mode="Markdown", reply_markup=builder.as_markup())
+            
+        except Exception as e:
+            logging.error(f"Ошибка в create_backup_task: {e}")
+            try:
+                await callback.message.edit_text(f"❌ Ошибка: {str(e)}")
+            except:
+                pass
+    
+    asyncio.create_task(create_backup_task())
+
+# ... (остальные функции остаются без изменений)
+# list_backups_callback, close_backup_callback, admin_panel_redirect
